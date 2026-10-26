@@ -1,3 +1,12 @@
+> [!IMPORTANT]
+> **Unofficial fork branch: `side-camera-online`.** This is not the official project and not made by its author.
+>
+> - **What this branch adds:** an independent local 1P / 2P side. Each player can see their own fighter on the side they choose (LEFT 1P / RIGHT 2P) on their own screen, offline and in online Player Matches. It covers the camera, HUD, input, W/S sidestep and character select. Details, status and known issues: **[docs/side-camera-online/README.md](docs/side-camera-online/README.md)**.
+> - **Based on** upstream v0.1.6. **No builds of this branch are distributed.** The download buttons and release links below are the original project's official releases.
+> - **Original project and all credit:** [shihabal3amri/tekken-tag-tournament-2-pc](https://github.com/shihabal3amri/tekken-tag-tournament-2-pc). Everything below this box is the original README, unchanged.
+>
+> **비공식 포크 브랜치입니다.** 공식 프로젝트가 아니며 원작자와 관계없습니다. 이 브랜치는 각 PC가 자기 화면에서 고른 쪽(1P/2P)에 자기 캐릭터를 보이게 하는 기능을 더합니다. 자세한 내용은 위 문서를 보세요. 이 브랜치의 빌드는 배포하지 않으며, 아래 다운로드는 원본 공식 릴리스입니다.
+
 <p align="center">
   <img src=".github/assets/banner.png" alt="Tekken Tag Tournament 2 - native PC port" width="100%">
 </p>
