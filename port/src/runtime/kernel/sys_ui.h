@@ -56,6 +56,7 @@ uint16_t SysUiGameButtonMask();
 // stick as D-pad), read even while the game gets neutral input; and a 150 ms START press for
 // player 1 (the title continues once a profile is signed in).
 uint16_t HostControllerButtons();
+uint16_t HostControllerButtonsForUser(uint32_t xamUser);
 // The triggers are not buttons: true while any connected pad holds one.
 bool HostTriggerHeld();
 void HostPulseStart();

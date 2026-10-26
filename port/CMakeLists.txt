@@ -4,6 +4,8 @@ project(tekken_recomp CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(TTT2_LOCAL_SAVES "Enable the experimental persistent local save container" OFF)
+option(TTT2_SIDE_CAMERA_TEST_SANDBOX "Require an isolated save root for experimental camera builds" OFF)
+option(TTT2_SIDE_CAMERA_PPC_WRITER_PROBE "Instrument selected raw PPC camera matrix B stores (experimental)" OFF)
 
 # Recompiler output + XenonRecomp runtime headers (generated / third-party, not in repo).
 set(PPC_DIR      "${CMAKE_SOURCE_DIR}/../re/ppc"                       CACHE PATH "generated PPC C++")
@@ -20,8 +22,21 @@ file(GLOB PPC_SOURCES CONFIGURE_DEPENDS
     "${PPC_DIR}/ppc_func_mapping.cpp")
 
 # The recompiled game code, as a static library (Gate 1: it must compile & link).
+set(TTT2_PREBUILT_PPC "" CACHE FILEPATH "Optional unchanged PPC archive for runtime-only diagnostic builds")
+set(TTT2_PREBUILT_PPC_SHA256 "" CACHE STRING "Required SHA256 when reusing a PPC archive")
+if(TTT2_PREBUILT_PPC)
+    file(SHA256 "${TTT2_PREBUILT_PPC}" _ppc_sha256)
+    if(NOT _ppc_sha256 STREQUAL TTT2_PREBUILT_PPC_SHA256)
+        message(FATAL_ERROR "Prebuilt PPC archive SHA256 mismatch")
+    endif()
+    add_library(tekken_ppc STATIC IMPORTED)
+    set_target_properties(tekken_ppc PROPERTIES IMPORTED_LOCATION "${TTT2_PREBUILT_PPC}")
+else()
 add_library(tekken_ppc STATIC ${PPC_SOURCES})
 target_include_directories(tekken_ppc PRIVATE "${PPC_DIR}" "${XENON_UTILS}" "${SIMDE_DIR}")
+if(TTT2_SIDE_CAMERA_PPC_WRITER_PROBE)
+    target_compile_definitions(tekken_ppc PRIVATE TTT2_SIDE_CAMERA_PPC_WRITER_PROBE=1)
+endif()
 # Keep the quick bring-up build at O0; use a separate build directory for performance runs.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
     # clang-cl parses bare -O1 as MSVC /O1 (size optimization). Forward the actual
@@ -54,6 +69,7 @@ if(TTT2_PPC_MARCH)
 endif()
 
 # XMA audio decoding: a minimal static FFmpeg (C) built from the local download of its source.
+endif() # TTT2_PREBUILT_PPC
 enable_language(C)
 add_subdirectory(third_party/ffmpeg_xma)
 
@@ -70,6 +86,7 @@ target_include_directories(tekken_recomp PRIVATE
     "${PPC_DIR}" "${XENON_UTILS}" "${SIMDE_DIR}"
     "${CMAKE_SOURCE_DIR}/src/runtime" "${CMAKE_SOURCE_DIR}/src/runtime/kernel")
 target_compile_definitions(tekken_recomp PRIVATE TTT2_LOCAL_SAVES=$<BOOL:${TTT2_LOCAL_SAVES}>)
+target_compile_definitions(tekken_recomp PRIVATE TTT2_SIDE_CAMERA_TEST_SANDBOX=$<BOOL:${TTT2_SIDE_CAMERA_TEST_SANDBOX}>)
 target_compile_definitions(tekken_recomp PRIVATE TTT2_DRAW_CAPTURE_DIAGNOSTICS=1)
 target_compile_definitions(tekken_recomp PRIVATE TTT2_D3D11_MOVIE_BACKEND=1)
 # Hardware renderer (gpu_hw_d3d11.h); still opt-in at run time with TTT2_GPU_HW=1 / compare.

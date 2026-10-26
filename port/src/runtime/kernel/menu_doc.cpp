@@ -320,6 +320,7 @@ void AddSystemFrames(Doc& d);
 void AddSwitchProfile(Doc& d);
 void AddKeyboardMode(Doc& d);
 void AddInputDelay(Doc& d);
+void AddPlayerSidePrototype(Doc& d);
 
 void Edit(Doc& d, const PcLists& lists, std::string* note)
 {
@@ -432,6 +433,9 @@ void Edit(Doc& d, const PcLists& lists, std::string* note)
 
     AddSwitchProfile(d);
     AddSystemFrames(d);
+    Doc sidePrototype = d;
+    try { AddPlayerSidePrototype(sidePrototype); d = std::move(sidePrototype); }
+    catch (const Fail& e) { if (note) *note += std::string("Player side prototype left out: ") + e.what(); }
     // KEYBOARD edits a copy: if the screen is not as measured, only that part is left out.
     Doc keyboard = d;
     try { AddKeyboardMode(keyboard); d = std::move(keyboard); }
@@ -650,6 +654,45 @@ void AddSystemFrames(Doc& d)
     d.Set(empty, "name", "FrameSysEmpty");
     frames.push_back(std::move(empty));
     top.insert(top.begin() + std::ptrdiff_t(at) + 1, frames.begin(), frames.end());
+}
+
+// An isolated native-style preview frame. Retail mode-entry scripts stay intact
+// until the local XAM-user -> battle-slot mapping and return route are verified.
+void AddPlayerSidePrototype(Doc& d)
+{
+    Node frame = d.Find("FrameSysMenu2");
+    const std::pair<std::string, std::string> names[] = {
+        {"MenuSysMenu2", "MenuPlayerSideSelect"},
+        {"StaticIconSysMenu2", "StaticIconPlayerSideSelect"},
+        {"StaticSysMenu2_0", "StaticPlayerSideSelect_0"},
+        {"SysMenu2_icon_S_array", "PlayerSideSelect_icon_S_array"},
+        {"SysMenu2_icon_L_array", "PlayerSideSelect_icon_L_array"}
+    };
+    const auto rename = [&](auto&& self, Node& node) -> void {
+        for (auto& attr : node.attrs) {
+            size_t at = 0;
+            while ((at = attr.value.find("SysMenu2", at)) != std::string::npos) {
+                attr.value.replace(at, 8, "PlayerSideSelect");
+                at += 16;
+            }
+        }
+        if (node.text.compare(0, 4, "xtal") == 0) {
+            for (const auto& [from, to] : names)
+                if (node.text.find(from) != std::string::npos) XtalRename(node.text, from, to);
+        }
+        for (Node& child : node.children) self(self, child);
+    };
+    rename(rename, frame);
+    size_t at = 0;
+    auto& top = d.ListOf("FrameSysEmpty", at);
+    top.insert(top.begin() + std::ptrdiff_t(at), std::move(frame));
+    for (int i = 1; i <= 2; ++i) {
+        const std::string suffix = "_0" + std::to_string(i);
+        d.Set(d.Find(("MenuItemPlayerSideSelect" + suffix).c_str()), "text",
+              i == 1 ? "LEFT SIDE  [1P]" : "RIGHT SIDE  [2P]");
+        d.Set(d.Find(("StaticPlayerSideSelect" + suffix).c_str()), "text",
+              "PLAYER SIDE SELECT - LEFT/RIGHT: SELECT  A: CONFIRM  B: BACK");
+    }
 }
 
 } // namespace

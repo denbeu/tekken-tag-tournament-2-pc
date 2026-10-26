@@ -32,8 +32,16 @@ def main():
             address = int(match[1], 16)
             if address not in wanted:
                 continue
-            end = text.find("\n__attribute__", match.end())
-            bodies[address] = text[match.end():end if end >= 0 else len(text)]
+            # PPC_FUNC_IMPL bodies end at a top-level brace followed by the
+            # matching PPC_WEAK_FUNC wrapper. The old "__attribute__" delimiter
+            # belongs to an earlier generator and may span the ENTIRE chunk,
+            # making unrelated virtual-dispatch bctr calls look unresolved.
+            end_marker = f"\n}}\n\nPPC_WEAK_FUNC(sub_{match[1]})"
+            end = text.find(end_marker, match.end())
+            if end < 0:
+                errors.append(f"Missing body terminator for {address:08X} in {path.name}")
+                continue
+            bodies[address] = text[match.end():end]
     image = IMAGE.read_bytes()
     total = 0
     for start, reg, table, count, width, shift, case_base, signature, _ in SWITCHES:

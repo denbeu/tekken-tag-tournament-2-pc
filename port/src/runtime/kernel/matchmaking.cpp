@@ -13,6 +13,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <string>
 #include <thread>
 
 namespace mm {
@@ -181,6 +182,19 @@ std::vector<SessionRecord> List(uint32_t max)
             }
             out.push_back(std::move(r));
         }
+        // Phase 11-C: the sessions a search found, when they change (ids to match against the host's "[mm] published").
+        static std::mutex logMutex;
+        static std::string last;
+        std::string ids;
+        char one[40];
+        for (const SessionRecord& r : out)
+        {
+            std::snprintf(one, sizeof(one), " %016llX(%u/%u)", (unsigned long long)r.id, r.filledPublic, r.maxPublic);
+            ids += one;
+        }
+        std::lock_guard l(logMutex);
+        if (ids != last) std::fprintf(stderr, "[mm] lobby search: %zu sessions%s\n", out.size(), ids.c_str());
+        last = ids;
         return out;
     }
     std::vector<std::pair<std::filesystem::file_time_type, SessionRecord>> found;
@@ -205,7 +219,21 @@ bool Find(uint64_t id, SessionRecord& out)
         const auto it = g_seen.find(id);
         if (it != g_seen.end()) { out = it->second; return true; }
     }
-    if (Steam()) return false;
+    if (Steam())
+    {
+        // Phase 11-C: not seen yet (a search by id before any list, or the list was older than the host's
+        // session): one fresh lobby search; only a host's real lobby record with this id counts.
+        for (SessionRecord& r : List(64))
+            if (r.id == id)
+            {
+                std::fprintf(stderr, "[mm] session %016llX found by a fresh lobby search\n", (unsigned long long)id);
+                out = std::move(r);
+                return true;
+            }
+        std::fprintf(stderr, "[mm] session %016llX: no Steam lobby has it (the host closed it, or it is not public)\n",
+                     (unsigned long long)id);
+        return false;
+    }
     const std::filesystem::path file = FileOf(id);
     return Fresh(file) && Load(file, out);
 }

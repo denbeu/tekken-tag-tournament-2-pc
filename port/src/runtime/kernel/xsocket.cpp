@@ -184,6 +184,9 @@ void Receive(uint64_t from, net::Channel, const uint8_t* data, size_t size)
             if (s.kind == Kind::Stream && s.state == TcpState::Listening && s.port == h.dstPort) { listener = &s; break; }
         if (!listener || listener->accepted.size() >= 16)
         {
+            // Phase 11-C: always logged - a join that reaches the host but finds nothing listening.
+            std::fprintf(stderr, "[xsocket] connection from %016llX to port %u refused (%s)\n", (unsigned long long)from, h.dstPort,
+                         listener ? "backlog full" : "nothing listens");
             SendPacket(from, net::Channel::Reliable, Op::Reset, h.proto, true, h.dstPort, h.srcPort, h.connId, nullptr, 0);
             break;
         }
@@ -201,14 +204,27 @@ void Receive(uint64_t from, net::Channel, const uint8_t* data, size_t size)
         g_sockets.emplace(handle, std::move(c));          // map nodes are stable: `listener` stays valid
         listener->accepted.push_back(handle);
         SendPacket(from, net::Channel::Reliable, Op::SynAck, 6, true, h.dstPort, h.srcPort, h.connId, nullptr, 0);
+        std::fprintf(stderr, "[xsocket] connection from %016llX to port %u accepted\n", (unsigned long long)from, h.dstPort);
         break;
     }
     default:
         for (auto& [handle, s] : g_sockets)
         {
             if (s.kind != Kind::Stream || s.peer != from || s.connId != h.connId || s.connector != bool(h.toConnector)) continue;
-            if (h.op == Op::SynAck && s.state == TcpState::Connecting) s.state = TcpState::Connected;
-            else if (h.op == Op::Reset) { s.state = s.state == TcpState::Connecting ? TcpState::Refused : TcpState::PeerClosed; s.pendingError = WSAECONNRESET_; }
+            // Phase 11-C: a connect's answer is always logged (the guest's half of a join).
+            if (h.op == Op::SynAck && s.state == TcpState::Connecting)
+            {
+                s.state = TcpState::Connected;
+                std::fprintf(stderr, "[xsocket] connected to %016llX port %u\n", (unsigned long long)from, s.peerPort);
+            }
+            else if (h.op == Op::Reset)
+            {
+                if (s.state == TcpState::Connecting)
+                    std::fprintf(stderr, "[xsocket] connection to %016llX port %u refused by the peer\n", (unsigned long long)from,
+                                 s.peerPort);
+                s.state = s.state == TcpState::Connecting ? TcpState::Refused : TcpState::PeerClosed;
+                s.pendingError = WSAECONNRESET_;
+            }
             else if (h.op == Op::Data) s.stream.insert(s.stream.end(), payload, payload + payloadSize);
             else if (h.op == Op::Fin) s.state = TcpState::PeerClosed;
             break;
@@ -349,7 +365,13 @@ PPC_FUNC(__imp__NetDll_connect)
     uint16_t port = 0;
     ReadAddr(base, ctx.r5.u32, addr, port);
     const uint64_t peer = xlive::PeerOfAddr(addr);
-    if (!peer) { ctx.r3.u64 = uint32_t(Fail(WSAEHOSTUNREACH_)); return; }
+    if (!peer)
+    {
+        std::fprintf(stderr, "[xsocket] connect to %u.%u.%u.%u:%u: no peer has this address\n", addr >> 24, (addr >> 16) & 0xFF,
+                     (addr >> 8) & 0xFF, addr & 0xFF, port);
+        ctx.r3.u64 = uint32_t(Fail(WSAEHOSTUNREACH_));
+        return;
+    }
     if (!s->bound) { s->port = Ephemeral(); s->bound = true; }
     if (s->kind == Kind::Datagram)
     {
@@ -370,7 +392,13 @@ PPC_FUNC(__imp__NetDll_connect)
     const bool done = WaitFor(l, [&] { Socket* x = Find(handle); return !x || x->state != TcpState::Connecting; }, 10000);
     s = Find(handle);
     if (!s) { ctx.r3.u64 = uint32_t(Fail(WSAENOTSOCK_)); return; }
-    if (!done) { s->state = TcpState::Refused; ctx.r3.u64 = uint32_t(Fail(WSAETIMEDOUT_)); return; }
+    if (!done)
+    {
+        std::fprintf(stderr, "[xsocket] connection to %016llX port %u timed out (10 s, no answer)\n", (unsigned long long)peer, port);
+        s->state = TcpState::Refused;
+        ctx.r3.u64 = uint32_t(Fail(WSAETIMEDOUT_));
+        return;
+    }
     if (s->state != TcpState::Connected) { ctx.r3.u64 = uint32_t(Fail(WSAECONNREFUSED_)); return; }
     ctx.r3.u64 = 0;
 }

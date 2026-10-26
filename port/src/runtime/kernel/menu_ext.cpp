@@ -23,6 +23,9 @@
 #include "sys_ui.h"
 #include "profiles.h"
 #include "keyboard_keys.h"
+#include "player_side_select.h"
+#include "side_camera_diag.h"
+#include "xlive.h"
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -46,8 +49,13 @@ extern "C" PPC_FUNC(__imp__sub_8241B9D0);
 extern "C" PPC_FUNC(__imp__sub_8256C708);
 extern "C" PPC_FUNC(__imp__sub_82374700);
 extern "C" PPC_FUNC(__imp__sub_823747C0);
+extern "C" PPC_FUNC(__imp__sub_825ED4F0);
+extern "C" PPC_FUNC(__imp__sub_82374738);
+extern "C" PPC_FUNC(__imp__sub_826BF778);
+extern "C" PPC_FUNC(__imp__sub_826BEF60);
 extern void (*g_uiFrameHook)(PPCContext& ctx, uint8_t* base);
 void XamNotifyEnqueueEvent(uint32_t id, uint32_t param);
+bool XSessionAnyActive();
 
 namespace {
 bool EnvFlag(const char* name)
@@ -1009,10 +1017,411 @@ void Frame(PPCContext& ctx, uint8_t* base)
 // Runs on the game's main thread once per frame (end of VdSwap, registers restored after): the
 // system UI, and a diagnostics trigger - C:/ttt2/port/ui.trigger holding a frame name switches
 // the menu to that frame.
+namespace sideselect {
+// Phase 9 (player_side_select.h): PLAYER SIDE SELECT between OFFLINE MODE and character select.
+// The PRACTICE / OFFLINEENTRY request of the OFFLINE MODE items is held back (sub_825ED4F0 hook
+// below), FramePlayerSideSelect (menu_doc.cpp) is shown, and on A the same request goes out
+// unchanged once every pad is released. TTT2_PLAYER_SIDE_SELECT=0 turns the screen off.
+player_side_select::SideSelectFlow flow;
+std::atomic<bool> owns{false};
+bool loaded = false;
+uint32_t holderCell = 0;                      // guest cell holding the ModeManager impl pointer
+uint32_t practiceOption = 0xFFFFFFFFu;        // BATTLE POSITION when PRACTICE was held back
+
+// Phase 10: TTT2_PRACTICE_BATTLE_POSITION=0 keeps PRACTICE exactly as requested (side then only
+// moves the camera / HUD in battle, the Phase 9 behaviour).
+bool PracticeBattlePositionLink()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_PRACTICE_BATTLE_POSITION"); return !(e && std::strcmp(e, "0") == 0); }();
+    return on;
+}
+
+// lib::GameOptionGetBattlePosition / SetBattlePosition natives (options+16). The setter's port
+// hook (INPUT DELAY from the Game Options widget) is bypassed: only the option itself is stored.
+uint32_t ReadBattlePosition(PPCContext& ctx, uint8_t* base)
+{
+    const PPCContext saved = ctx;
+    uint32_t value = 0xFFFFFFFFu;
+    {
+        GuestFrame frame(ctx, base, 0x100);
+        __imp__sub_82374738(ctx, base);
+        value = ctx.r3.u32;
+    }
+    ctx = saved;
+    return value;
+}
+void WriteBattlePosition(PPCContext& ctx, uint8_t* base, uint32_t value)
+{
+    const PPCContext saved = ctx;
+    {
+        GuestFrame frame(ctx, base, 0x100);
+        ctx.r3.u64 = value;
+        __imp__sub_82374700(ctx, base);
+    }
+    ctx = saved;
+}
+
+bool Enabled()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_PLAYER_SIDE_SELECT"); return !(e && std::strcmp(e, "0") == 0); }();
+    return on;
+}
+
+// The last confirmed side, in the save root the launcher isolates (never the user's saves).
+std::string PrefPath()
+{
+    const char* root = std::getenv("TTT2_SAVE_ROOT");
+    return (root && *root) ? std::string(root) + "\\player_side.ini" : std::string();
+}
+void LoadPreference()
+{
+    if (loaded) return;
+    loaded = true;
+    const std::string path = PrefPath();
+    if (path.empty()) return;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return;
+    char line[64] = {};
+    std::fread(line, 1, sizeof(line) - 1, f);
+    std::fclose(f);
+    if (std::strstr(line, "Side=Right")) flow.saved = flow.cursor = player_side_select::Side::Right;
+}
+void SavePreference()
+{
+    const std::string path = PrefPath();
+    if (path.empty()) return;
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return;
+    std::fprintf(f, "[PlayerSide]\r\nSide=%s\r\n", flow.saved == player_side_select::Side::Right ? "Right" : "Left");
+    std::fclose(f);
+}
+
+void HeldButtons(uint16_t held[4])
+{
+    for (uint32_t u = 0; u < 4; ++u) held[u] = HostControllerButtonsForUser(u);
+}
+
+void Draw(PPCContext& ctx, uint8_t* base)
+{
+    const bool right = flow.cursor == player_side_select::Side::Right;
+    MenuMovieVisible(ctx, base, "rmc_icon_menu_L", false);
+    MenuTextHide(ctx, base, "StaticIconPlayerSideSelect", false);
+    MenuSetText(ctx, base, "StaticIconPlayerSideSelect", "PLAYER SIDE SELECT");
+    MenuSetText(ctx, base, "StaticTelopPlayerSideSelect", "UP/DOWN: SELECT   A: CONFIRM   B: BACK");
+    MenuTelopTarget(ctx, base, "StaticTelopPlayerSideSelect");
+    MenuSetCursor(ctx, base, "MenuPlayerSideSelect", right ? 1 : 0);
+    MenuMoviePlay(ctx, base, "amc_menu_bar_sentaku_L",
+                  right ? "menu_bar_sentaku_solo_02" : "menu_bar_sentaku_solo_01", true);
+    for (int i = 0; i < 2; ++i) {
+        const std::string suffix = i ? "_02" : "_01";
+        MenuSetText(ctx, base, "StaticValuePlayerSideSelect" + suffix, (right == bool(i)) ? "SELECTED" : "");
+        // The long Phase 9 description overlaid the row's SELECTED marker. Keep
+        // the original game's compact two-line menu labels unobstructed.
+        MenuTextHide(ctx, base, "StaticPlayerSideSelect" + suffix, true);
+        MenuMoviePlay(ctx, base, "mc_icon_menu_S_L" + suffix,
+                      right == bool(i) ? "icon_s_006" : "icon_s_006_x", true);
+    }
+}
+
+// From the sub_825ED4F0 hook: true when the request is held back for the side select.
+bool Intercept(PPCContext& ctx, uint8_t* base)
+{
+    using namespace player_side_select;
+    if (!Enabled() || !IsSideSelectMode(ctx.r4.u32) || flow.state != FlowState::Idle) return false;
+    if (XSessionAnyActive()) return false;
+    const PPCContext saved = ctx;
+    bool ok = false;
+    {
+        // Only the OFFLINE MODE items (rematch and result menus request modes too), and only when
+        // the main menu document carries the side select frame.
+        ok = keyui::CurrentFrame(ctx, base) == "FrameMode002-01" &&
+             FindWidget(ctx, base, GuestStr(base, "MenuPlayerSideSelect")) != 0;
+    }
+    ctx = saved;
+    const uint32_t impl = ok ? GRead32(base, ctx.r3.u32) : 0;
+    if (!ok || !impl) return false;
+    LoadPreference();
+    // The script's ModeManager wrapper is not kept; the impl it points at is the singleton.
+    if (!holderCell) holderCell = GuestCopy(base, "\0\0\0\0", 4);
+    GWrite32(base, holderCell, impl);
+    ModeRequest request{holderCell, ctx.r4.u32, ctx.r5.u32};
+    if (!flow.Request(request, true, false, true)) return false;
+    practiceOption = 0xFFFFFFFFu;
+    if (request.mode == kModePractice && PracticeBattlePositionLink()) {
+        // The screen opens on the side the game's own BATTLE POSITION already gives.
+        practiceOption = ReadBattlePosition(ctx, base);
+        flow.cursor = SideForBattlePosition(practiceOption, flow.cursor);
+    }
+    owns = true;
+    std::fprintf(stderr, "[side-select] mode %u (arg %u) held for PLAYER SIDE SELECT\n", request.mode, request.arg);
+    return true;
+}
+
+void Frame(PPCContext& ctx, uint8_t* base)
+{
+    using namespace player_side_select;
+    ttt2_side_camera_diag::MaintainSidePolicy(GetTickCount64());
+    if (flow.state == FlowState::Idle) { owns = false; return; }
+    if (XSessionAnyActive()) {                 // never on line: drop the screen and the request
+        const Side keep = flow.saved;
+        flow = SideSelectFlow{};
+        flow.saved = flow.cursor = keep;
+        owns = false;
+        return;
+    }
+    uint16_t held[4];
+    HeldButtons(held);
+    if (flow.state == FlowState::Opening) {
+        SwitchFrame(ctx, base, "FramePlayerSideSelect");
+        flow.BeginOpen(held);
+        return;
+    }
+    switch (flow.Poll(held)) {
+    case FlowEvent::Opened:
+        Draw(ctx, base);
+        break;
+    case FlowEvent::Redraw:
+        Draw(ctx, base);
+        MenuSound(ctx, base, kSoundCursor);
+        break;
+    case FlowEvent::Confirmed: {
+        uint32_t teamHint = 0xFFFFFFFFu;
+        if (flow.pending.mode == kModePractice && PracticeBattlePositionLink()) {
+            // Put the player on the chosen side the way Game Options does it: the option and the
+            // argument the game derives from it. Skipped (request untouched) unless the held
+            // argument is exactly the game's own derivation of the current option.
+            const PracticePositionPlan plan = PlanPracticeBattlePosition(practiceOption, flow.pending.arg, flow.saved);
+            if (plan.apply) {
+                WriteBattlePosition(ctx, base, plan.position);
+                std::fprintf(stderr, "[side-select] PRACTICE: BATTLE POSITION %u -> %u, request arg %u -> %u (game mapping)\n",
+                             practiceOption, plan.position, flow.pending.arg, plan.arg);
+                flow.pending.arg = plan.arg;
+                teamHint = plan.position;   // LEFT -> team 0 (1P), RIGHT -> team 1 (2P)
+            } else {
+                std::fprintf(stderr, "[side-select] PRACTICE: option %u / arg %u not the known mapping; request left unchanged\n",
+                             practiceOption, flow.pending.arg);
+            }
+        }
+        ttt2_side_camera_diag::SetPlayerSidePreference(
+            flow.saved == Side::Right ? ttt2_side_camera_diag::PlayerScreenSide::Right
+                                      : ttt2_side_camera_diag::PlayerScreenSide::Left,
+            flow.confirmUser, teamHint);
+        SavePreference();
+        SwitchFrame(ctx, base, "FrameMode002-01");
+        MenuSound(ctx, base, kSoundDecide);
+        std::fprintf(stderr, "[side-select] %s confirmed by XAM user %u\n",
+                     flow.saved == Side::Right ? "RIGHT" : "LEFT", flow.confirmUser);
+        break;
+    }
+    case FlowEvent::Cancelled:
+        SwitchFrame(ctx, base, "FrameMode002-01");
+        MenuSound(ctx, base, kSoundCancel);
+        break;
+    case FlowEvent::Dispatch: {
+        // The held request. Its argument is the menu's own, except PRACTICE after a confirmed
+        // BATTLE POSITION change (PlanPracticeBattlePosition: 1 or 2, never 0). Forcing arg 0
+        // (no human side) is what sent the 2026-10-25 trial into the attract demo.
+        const PPCContext saved = ctx;
+        {
+            GuestFrame frame(ctx, base, 0x100);
+            ctx.r3.u64 = flow.pending.holder;
+            ctx.r4.u64 = flow.pending.mode;
+            ctx.r5.u64 = flow.pending.arg;
+            __imp__sub_825ED4F0(ctx, base);
+        }
+        ctx = saved;
+        std::fprintf(stderr, "[side-select] mode %u requested\n", flow.pending.mode);
+        break;
+    }
+    default:
+        break;
+    }
+    owns = flow.OwnsInput();
+}
+} // namespace sideselect
+
+namespace roomside {
+// Phase 11 (player_side_select.h RoomSideWindow): PLAYER SIDE SELECT once both players are READY.
+// The battle-ready hold (sub_826BF778, below; BattleReadyHold) records its countdown each frame;
+// here, once per frame, the window opens in the game's dialog window, counts the 10 s down and ends
+// with the hold's 10 s (the side becomes this client's local view; `applied` lets the hold go) or
+// with the hold left (nothing kept). TTT2_ONLINE_SIDE_SELECT=0 turns it off.
+player_side_select::RoomSideWindow window;
+player_side_select::BattleReadyHold hold;       // the game thread's (sub_826BF778)
+std::atomic<bool> applied{false};               // this hold's side is set
+std::atomic<bool> owns{false};
+bool releasing = false;
+bool loaded = false;
+std::mutex viewMutex;
+player_side_select::RoomCountdownView latest;
+int64_t latestMs = 0;
+
+bool Enabled()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_ONLINE_SIDE_SELECT"); return !(e && std::strcmp(e, "0") == 0); }();
+    return on;
+}
+
+// The last online side, next to the offline one in the isolated save root.
+std::string PrefPath()
+{
+    const char* root = std::getenv("TTT2_SAVE_ROOT");
+    return (root && *root) ? std::string(root) + "\\player_side_online.ini" : std::string();
+}
+void LoadPreference()
+{
+    if (loaded) return;
+    loaded = true;
+    const std::string path = PrefPath();
+    if (path.empty()) return;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return;
+    char line[64] = {};
+    std::fread(line, 1, sizeof(line) - 1, f);
+    std::fclose(f);
+    if (std::strstr(line, "Side=")) {
+        window.havePreference = true;
+        window.preference = std::strstr(line, "Side=Right") ? player_side_select::Side::Right : player_side_select::Side::Left;
+    }
+}
+void SavePreference()
+{
+    const std::string path = PrefPath();
+    if (path.empty()) return;
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return;
+    std::fprintf(f, "[PlayerSideOnline]\r\nSide=%s\r\n", window.preference == player_side_select::Side::Right ? "Right" : "Left");
+    std::fclose(f);
+}
+
+void Record(const player_side_select::RoomCountdownView& view)
+{
+    std::lock_guard l(viewMutex);
+    latest = view;
+    latestMs = sysui::NowMs();
+}
+
+sysui::BoxState Box()
+{
+    sysui::BoxState b;
+    b.style = sysui::BoxStyle::List;
+    b.box.text = "PLAYER SIDE SELECT\nTIME LEFT  " + std::to_string((std::max)(window.seconds, 0)) + "\nUP/DOWN: SELECT   A: CONFIRM";
+    b.box.buttons = { "LEFT SIDE  [1P]", "RIGHT SIDE  [2P]" };
+    b.cursor = window.cursor == player_side_select::Side::Right ? 1 : 0;
+    return b;
+}
+
+// Phase 12-D: after an early A, until the game leaves the room for character select (mode 8).
+std::atomic<uint32_t> waitBudget{0};            // battle_ready_wait frames still to absorb
+bool waiting = false;
+int64_t waitingSinceMs = 0;
+constexpr int64_t kWaitingBoxMaxMs = 25000;
+sysui::BoxState WaitingBox()
+{
+    sysui::BoxState b;
+    b.style = sysui::BoxStyle::List;
+    b.box.text = "PLAYER SIDE SELECT\nWAITING FOR THE OTHER PLAYER";
+    b.box.buttons = { window.preference == player_side_select::Side::Right ? "RIGHT SIDE  [2P]" : "LEFT SIDE  [1P]" };
+    b.cursor = 0;
+    return b;
+}
+
+void Frame(PPCContext& ctx, uint8_t* base)
+{
+    using namespace player_side_select;
+    if (!Enabled()) return;
+    if (waiting) {
+        const uint32_t mode = ttt2_side_camera_diag::CurrentGameMode(base);
+        if (mode == kModeCharaSelect || !XSessionAnyActive() || sysui::NowMs() - waitingSinceMs > kWaitingBoxMaxMs) {
+            waiting = false;
+            sysui::HideDialog(ctx, base);
+            std::fprintf(stderr, "[side-select] waiting box closed (mode %u, %lld ms)\n", mode,
+                         (long long)(sysui::NowMs() - waitingSinceMs));
+        }
+        return;
+    }
+    if (releasing) {
+        if (HostControllerButtons() == 0) { releasing = false; owns = false; }
+        return;
+    }
+    RoomCountdownView view;
+    {
+        std::lock_guard l(viewMutex);
+        view = latest;
+        // The room timer runs every frame in the room; anything older is not the room any more.
+        if (sysui::NowMs() - latestMs > 500) view.valid = false;
+    }
+    if (!window.open && (!XSessionAnyActive() || sysui::g_box.showing)) view.valid = false;
+    LoadPreference();
+    uint16_t held[4];
+    for (uint32_t u = 0; u < 4; ++u) held[u] = HostControllerButtonsForUser(u);
+    switch (window.Update(view, held)) {
+    case RoomWindowEvent::Opened:
+        owns = true;
+        sysui::ShowBox(ctx, base, Box());
+        MenuSound(ctx, base, kSoundCursor);
+        std::fprintf(stderr, "[side-select] room countdown %u: PLAYER SIDE SELECT (%d s, hold counter %u)\n",
+                     window.generation, window.seconds, view.counter);
+        break;
+    case RoomWindowEvent::Tick:
+        sysui::UpdateBox(ctx, base, Box());
+        break;
+    case RoomWindowEvent::Redraw:
+        sysui::UpdateBox(ctx, base, Box());
+        MenuSound(ctx, base, kSoundCursor);
+        break;
+    case RoomWindowEvent::Confirmed:
+        sysui::UpdateBox(ctx, base, Box());
+        MenuSound(ctx, base, kSoundDecide);
+        break;
+    case RoomWindowEvent::Unconfirmed:
+        sysui::UpdateBox(ctx, base, Box());
+        MenuSound(ctx, base, kSoundCancel);
+        break;
+    case RoomWindowEvent::Finished:
+        if (window.confirmed) MenuSound(ctx, base, kSoundDecide);
+        sysui::UpdateBox(ctx, base, WaitingBox());
+        waiting = true;
+        waitingSinceMs = sysui::NowMs();
+        ttt2_side_camera_diag::SetPlayerSidePreference(
+            window.preference == Side::Right ? ttt2_side_camera_diag::PlayerScreenSide::Right
+                                             : ttt2_side_camera_diag::PlayerScreenSide::Left,
+            window.user, 0xFFFFFFFFu, true);
+        // Phase 12: the owner is matched by this machine's online XUID in the battle (side_camera_diag).
+        ttt2_side_camera_diag::SetOnlineLocalXuid(xlive::OnlineXuid());
+        SavePreference();
+        applied = true;
+        releasing = true;
+        std::fprintf(stderr, "[side-select] room countdown %u ended (%s, %d s left): %s by XAM user %u - local view only\n",
+                     window.generation, window.confirmed ? "A confirmed" : "time up, highlighted side", window.seconds,
+                     window.preference == Side::Right ? "RIGHT" : "LEFT", window.user);
+        {
+            // For reference only (this match's table may not be filled yet; the battle decides).
+            const ttt2_side_camera_diag::OnlineOwner o =
+                ttt2_side_camera_diag::IdentifyOnlineOwner(base, xlive::OnlineXuid());
+            std::fprintf(stderr, "[side-owner] at READY: local XUID %016llX; sync engine %u nodes, local node slot %d, node 1 slot %d: %s\n",
+                         (unsigned long long)xlive::OnlineXuid(), o.nodes, int(o.slot[0]), int(o.slot[1]),
+                         o.team >= 0 ? (o.team == 0 ? "team 0" : "team 1") : o.reason);
+        }
+        break;
+    case RoomWindowEvent::Cancelled:
+        sysui::HideDialog(ctx, base);
+        releasing = true;
+        std::fprintf(stderr, "[side-select] room countdown %u cancelled (state %u, %u members): side select closed\n",
+                     window.generation, view.state, view.players);
+        break;
+    default:
+        break;
+    }
+}
+} // namespace roomside
+
 void UiFrame(PPCContext& ctx, uint8_t* base)
 {
     sysui::Frame(ctx, base);
     keyui::Frame(ctx, base);
+    sideselect::Frame(ctx, base);
+    roomside::Frame(ctx, base);
     static uint32_t tick = 0;
     if (++tick % 30) return;
     FILE* f = std::fopen("C:/ttt2/port/ui.trigger", "rb");
@@ -1030,7 +1439,7 @@ struct UiHookInstall { UiHookInstall() { g_uiFrameHook = UiFrame; } } g_uiHookIn
 } // namespace
 
 bool SysUiRequestSignIn() { sysui::g_signInRequest = true; return true; }
-bool SysUiOwnsInput() { return sysui::g_owns.load() || sysui::g_boxOwns.load() || keyui::g_capture.load(); }
+bool SysUiOwnsInput() { return sysui::g_owns.load() || sysui::g_boxOwns.load() || keyui::g_capture.load() || sideselect::owns.load() || roomside::owns.load(); }
 bool SysUiKeyCaptureActive() { return keyui::g_capture.load(); }
 uint16_t SysUiGameButtonMask() { return keyui::g_gameMask.load(); }
 void SysUiOnKey(int vk)
@@ -1219,6 +1628,91 @@ PPC_FUNC(sub_82374700)
             display_settings::SetInputDelayOn(GRead32(base, w + 368) == 1);
     }
     ctx = saved;
+}
+
+// Player Match state_battle_ready (sub_826BF778): room +40 once both fighters are READY, called each
+// frame by the room update (sub_826BED20) until it moves on to the synchronised states. Phase 11-D
+// holds it for the side select (player_side_select.h BattleReadyHold): not run while held, so room
+// +40 stays here and the game's battle sync starts only after the 10 s. The room itself, its READY
+// countdown and its packets are not touched. Off with TTT2_ONLINE_SIDE_SELECT=0 or outside an online
+// session.
+PPC_FUNC(sub_826BF778)
+{
+    const uint32_t room = ctx.r3.u32;
+    if (roomside::Enabled() && XSessionAnyActive())
+    {
+        using namespace player_side_select;
+        const HoldStep step = roomside::hold.Update(room, sysui::NowMs(), roomside::applied.load());
+        if (step == HoldStep::Start)
+        {
+            roomside::applied = false;
+            std::fprintf(stderr, "[side-select] both READY: battle ready held for PLAYER SIDE SELECT (10 s, hold %u)\n",
+                         roomside::hold.holds);
+        }
+        ttt2_side_camera_diag::PlayerMatchRoomCountdown c;
+        const bool read = ttt2_side_camera_diag::ReadPlayerMatchRoomCountdown(base, room, c);
+        RoomCountdownView view;
+        view.valid = true;
+        view.state = step == HoldStep::Release ? kRoomStateBattle : kRoomStateCountdown;
+        view.counter = roomside::hold.Counter();
+        view.players = read ? c.players : 2u;
+        view.nativeSide = read ? c.nativeSide : 0u;
+        roomside::Record(view);
+        if (step != HoldStep::Release)
+        {
+            ctx.r3.u64 = 0;
+            return;
+        }
+        roomside::waitBudget = BattleWaitExtension(roomside::hold.frames);
+        std::fprintf(stderr, "[side-select] battle ready released after %u frames (side %s) - the game's battle sync goes on"
+                             " (its peer wait extended by %u frames)\n",
+                     roomside::hold.frames, roomside::applied.load() ? "applied" : "NOT applied: window did not finish",
+                     roomside::waitBudget.load());
+    }
+    __imp__sub_826BF778(ctx, base);
+}
+
+// Player Match battle_ready_wait (sub_826BEF60, the state after state_battle_ready): room +180
+// counts frames to 600 while sub_826B8640 waits for the peer, then it goes on anyway. Phase 12-D: a
+// client that confirmed its side early has the frames it did not hold added (BattleWaitExtension).
+PPC_FUNC(sub_826BEF60)
+{
+    const uint32_t room = ctx.r3.u32;
+    uint32_t budget = roomside::waitBudget.load();
+    if (budget != 0u)
+    {
+        uint32_t counter = GRead32(base, room + 180);
+        if (player_side_select::AbsorbBattleWaitFrame(counter, budget))
+        {
+            GWrite32(base, room + 180, counter);
+            roomside::waitBudget = budget;
+            if (budget == 0u)
+                std::fprintf(stderr, "[side-select] peer wait extension used up (the game's own 600 frames go on)\n");
+        }
+        else if (counter > player_side_select::kRoomSideWindowFrames)
+            roomside::waitBudget = 0;
+    }
+    __imp__sub_826BEF60(ctx, base);
+}
+
+// ModeManager.requestChangeMode as Xtal binds it (sub_825ED4F0: wrapper r3, mode r4, arg r5 ->
+// (*wrapper)->vtable[1](mode, arg, 0); method table sub_825EDC18). PRACTICE (18, arg = the
+// BATTLE POSITION option) and OFFLINEENTRY (17) from OFFLINE MODE wait for PLAYER SIDE SELECT;
+// other modes than an offline battle's drop the side preference.
+PPC_FUNC(sub_825ED4F0)
+{
+    if (sideselect::Intercept(ctx, base))
+    {
+        ctx.r3.u64 = 1;
+        return;
+    }
+    const bool online = ttt2_side_camera_diag::IsOnlineSidePolicyActive();
+    if (online ? !player_side_select::KeepsOnlineSidePreference(ctx.r4.u32)
+               : !player_side_select::KeepsSidePreference(ctx.r4.u32)) {
+        if (online) std::fprintf(stderr, "[side-select] mode %u requested: the room's side choice is dropped\n", ctx.r4.u32);
+        ttt2_side_camera_diag::ClearPlayerSidePreference();
+    }
+    __imp__sub_825ED4F0(ctx, base);
 }
 
 // lib::GameOptionResetToDefaults (impl sub_823747C0): Game Options' DEFAULT resets INPUT DELAY too

@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <thread>
 #include <chrono>
 #include <atomic>
@@ -447,7 +448,31 @@ int main(int argc, char** argv)
 {
     // The Steam helper process (kernel/steam_bridge.cpp): Steam lives there so Steam Input does
     // not hide the controllers from the game. Nothing of the game starts in it.
-    if (argc >= 2 && std::strcmp(argv[1], "--steam-bridge") == 0) return steamnet::RunBridge();
+    if (argc >= 2 && std::strcmp(argv[1], "--steam-bridge") == 0) return steamnet::RunBridge(argc, argv);
+#if TTT2_SIDE_CAMERA_TEST_SANDBOX
+    // Fail closed for the experimental build: NEVER load or write real user saves.
+    // Only isolated F: camera research trace subdirectories are permitted.
+    wchar_t saveRoot[4096] = {};
+    const DWORD n = GetEnvironmentVariableW(L"TTT2_SAVE_ROOT", saveRoot, DWORD(std::size(saveRoot)));
+    constexpr wchar_t prefix[] = L"F:\\TTT2_SIDE_CAMERA_20261024\\traces\\";
+    // Normalise away dot-dot segments before the prefix test; the saving layer
+    // separately rejects reparse points and invalid/missing parent directories.
+    const std::wstring savePath = std::filesystem::path(saveRoot).lexically_normal().wstring();
+    // The diagnostic launcher passes the image on argv, so InstalledLayout()
+    // does not set TTT2_GPU_HW=1. Never let an experimental run silently
+    // fall back to expensive software rasterization.
+    const char* gpuMode = std::getenv("TTT2_GPU_HW");
+    if (!gpuMode || std::strcmp(gpuMode, "1") != 0) {
+        std::fputs("[side-camera] REFUSING start: hardware GPU requires TTT2_GPU_HW=1\n", stderr);
+        return 2;
+    }
+    if (!n || n >= std::size(saveRoot) ||
+        savePath.size() <= (std::size(prefix)-1) ||
+        _wcsnicmp(savePath.c_str(), prefix, (std::size(prefix)-1)) != 0) {
+        std::fputs("[side-camera] REFUSING start: set TTT2_SAVE_ROOT under F:\\TTT2_SIDE_CAMERA_20261024\\traces\\...\n", stderr);
+        return 2;
+    }
+#endif
     const std::string installedImage = InstalledLayout(argc);
     std::setvbuf(stderr, nullptr, _IONBF, 0);   // unbuffered: trace survives a hard crash
     StartLogWriter();

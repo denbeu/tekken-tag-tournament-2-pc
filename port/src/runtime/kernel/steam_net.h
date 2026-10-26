@@ -35,7 +35,7 @@ bool TakeJoinRequest(std::vector<uint8_t>& record);
 // config gives the game nothing back - so the game process must never load Steam. Unhooked
 // processes keep seeing the pads while app 480 runs. TTT2_STEAM_INPROC=1 = the old in-process
 // path (diagnostics only: no controller).
-int RunBridge();                         // main() of the helper process
+int RunBridge(int argc, char** argv);   // main() of the helper process (`--steam-bridge <in> <out>`: its frame pipes)
 
 // The in-process implementation (steam_net.cpp), used by the helper.
 namespace direct {

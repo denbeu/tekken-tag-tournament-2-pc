@@ -128,8 +128,9 @@ uint32_t Create(uint8_t* base, uint32_t b)
         if (nonceOut) s->nonce = Read64(base, nonceOut);
     }
     s->info.assign(base + info, base + info + 0x3C);
-    Log("create" + std::to_string(flags), "XSessionCreate(flags %03X, public %u, private %u) -> %016llX", flags,
-        s->maxPublic, s->maxPrivate, (unsigned long long)s->id);
+    // Phase 11-C: every session once (its id is what the other side searches / joins).
+    Log("create" + std::to_string(flags) + "_" + std::to_string(s->id), "XSessionCreate(flags %03X, public %u, private %u) -> %016llX%s", flags,
+        s->maxPublic, s->maxPrivate, (unsigned long long)s->id, (flags & kHost) ? " (host)" : " (joining)");
     Publish(*s);
     return S_OK_;
 }
@@ -285,10 +286,12 @@ uint32_t SearchById(uint8_t* base, uint32_t b)
     mm::SessionRecord r;
     if (!mm::Find(id, r))
     {
-        Log("searchbyid_miss", "XSessionSearchByID(%016llX) -> not found", (unsigned long long)id);
+        Log("searchbyid_miss" + std::to_string(id), "XSessionSearchByID(%016llX) -> not found (X_ONLINE_E_SESSION_NOT_FOUND)",
+            (unsigned long long)id);
         return X_ONLINE_E_SESSION_NOT_FOUND;
     }
-    Log("searchbyid", "XSessionSearchByID(%016llX) -> found", (unsigned long long)id);
+    Log("searchbyid" + std::to_string(id), "XSessionSearchByID(%016llX) -> found (host peer %016llX, %u/%u)", (unsigned long long)id,
+        (unsigned long long)r.hostPeer, r.filledPublic, r.maxPublic);
     return WriteResults(base, { r }, results, size);
 }
 

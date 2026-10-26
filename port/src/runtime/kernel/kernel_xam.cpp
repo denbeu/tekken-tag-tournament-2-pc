@@ -9,7 +9,10 @@
 #include "profiles.h"
 #include "sys_ui.h"
 #include "keyboard_keys.h"
+#include "side_camera_diag.h"
 #include "xlive.h"
+
+bool XSessionAnyActive();   // xsession.cpp
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -839,13 +842,14 @@ int64_t NowMs()
 
 // The system UI's view of the controllers (sys_ui.h): every connected pad's buttons (keyboard
 // included) with the left stick as a D-pad - read even while the game is given neutral input.
-uint16_t HostControllerButtons()
+uint16_t HostControllerButtonsForUser(uint32_t user)
 {
     EnsurePadThread();
+    if (user > 3) return 0;
     uint16_t b = 0;
-    for (auto& pad : g_pads)
+    auto& pad = g_pads[user];
     {
-        if (!pad.connected.load()) continue;
+        if (!pad.connected.load()) return 0;
         std::lock_guard lk(pad.m);
         const XINPUT_GAMEPAD& g = pad.state.Gamepad;
         b |= g.wButtons;
@@ -855,6 +859,13 @@ uint16_t HostControllerButtons()
         if (g.sThumbLX > 16000) b |= 0x0008;
     }
     return b;
+}
+
+uint16_t HostControllerButtons()
+{
+    uint16_t buttons = 0;
+    for (uint32_t user = 0; user < 4; ++user) buttons |= HostControllerButtonsForUser(user);
+    return buttons;
 }
 
 // True while a connected pad (keyboard included) holds a trigger past the XInput threshold.
@@ -937,6 +948,17 @@ PPC_FUNC(__imp__XamInputGetState)
         st.Gamepad.wButtons |= 0x0010;
         st.dwPacketNumber += 0x10000;           // a new packet while the pulse lasts
     }
+    const bool sysUiOrMenuActive =
+        SysUiOwnsInput() ||
+        SysUiTitleWantsProfile() ||
+        (user == 0 && SysUiGameButtonMask() != 0xFFFF) ||
+        SysUiTextEntryActive() ||
+        SysUiKeyCaptureActive();
+    uint32_t pktNumber = st.dwPacketNumber;
+    ttt2_side_camera_diag::TransformPadStateForLocalCamera(
+        base, user, sysUiOrMenuActive, XSessionAnyActive(),
+        pktNumber, st.Gamepad.wButtons, st.Gamepad.sThumbLX);
+    st.dwPacketNumber = pktNumber;
     if (user == 0)
     {
         // Input latency tests: the first read that returns new buttons (same clock as [burst]).

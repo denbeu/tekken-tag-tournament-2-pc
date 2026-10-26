@@ -17,6 +17,7 @@
 #include <intrin.h>
 #include "kernel_trace.h"
 #include "gpu_render.h"
+#include "side_camera_diag.h"
 #include "phys_mirror.h"
 #include "gpu_ring_reader.h"
 #include "bounded_format.h"
@@ -1609,6 +1610,7 @@ static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
             }
             if (GpuHwMode() && !early) HwPresentFrame(g_frontBufferPhys.load());
             FrameLogSwap();
+            ttt2_side_camera_diag::OnSwap();
             PhysMirrorInvalidateAll();                           // frame boundary
             static int slog = 0;
             if (slog < 8)
@@ -1695,8 +1697,15 @@ static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
                     reg = (bank < 5 ? base[bank] : 0x2000) + idx;
                 }
                 else reg = d0 & 0xFFFF;
+                const bool traceCamera = ttt2_side_camera_diag::Active();
                 for (uint32_t i = 1; i < cnt; ++i)
-                    WriteReg(reg + i - 1, GRead32(g_base, addr + i * 4));
+                {
+                    const uint32_t dst = reg + i - 1, src = addr + i * 4;
+                    const uint32_t raw = GRead32(g_base, src);
+                    if (traceCamera && ttt2_side_camera_diag::IsCameraRegister(dst))
+                        ttt2_side_camera_diag::OnConstantWrite(dst, raw, addr - 4, src, 0x100u | op);
+                    WriteReg(dst, raw);
+                }
                 static int sclog = 0;
                 if (sclog < 40)
                 {
@@ -1713,8 +1722,15 @@ static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
                 uint32_t bank = (ot >> 16) & 0xFF, idx = ot & 0x7FF;
                 static const uint32_t base[5] = { 0x4000, 0x4800, 0x4900, 0x4908, 0x2000 };
                 uint32_t reg = (bank < 5 ? base[bank] : 0x2000) + idx;
+                const bool traceCamera = ttt2_side_camera_diag::Active();
                 for (uint32_t i = 0; i < n && i < 4096; ++i)
-                    WriteReg(reg + i, GRead32(g_base, src + i * 4));
+                {
+                    const uint32_t dst = reg + i, srcWord = src + i * 4;
+                    const uint32_t raw = GRead32(g_base, srcWord);
+                    if (traceCamera && ttt2_side_camera_diag::IsCameraRegister(dst))
+                        ttt2_side_camera_diag::OnConstantWrite(dst, raw, addr - 4, srcWord, 0x12Fu);
+                    WriteReg(dst, raw);
+                }
                 static int lalog = 0;
                 if (lalog < 20)
                 {
@@ -1802,6 +1818,28 @@ static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
                     }
                     BoundedSnprintf(line + n2, sizeof(line) - n2, "\n");
                     std::fputs(line, stderr);
+                }
+                // Bounded, read-only candidate camera constant capture; separate from
+                // FrameLog (which can alter GPU vertex-shader path when enabled).
+                if (ttt2_side_camera_diag::Active() && dprim != 1 && dprim != 8 &&
+                    (g_regFile[0x2208] & 7u) != 6u)
+                {
+                    if (ttt2_side_camera_diag::WantsDrawHash())
+                    {
+                        const auto codeHash = [](uint32_t guest, uint32_t words) -> uint64_t {
+                            if (!guest || !words || words >= 4096) return 0;
+                            uint64_t h = 1469598103934665603ull;
+                            for (uint32_t i = 0; i < words; ++i) {
+                                h ^= GRead32(g_base, guest + i * 4);
+                                h *= 1099511628211ull;
+                            }
+                            return h;
+                        };
+                        ttt2_side_camera_diag::OnDraw(g_regFile, init,
+                            g_curVs, g_curVsSize, codeHash(g_curVs, g_curVsSize),
+                            g_curPs, g_curPsSize, codeHash(g_curPs, g_curPsSize));
+                    }
+                    else ttt2_side_camera_diag::OnSkippedDraw();
                 }
                 FrameLogDraw(init);
                 GpuExecuteDraw(g_regFile, init, indexAddr, index32,
@@ -1959,8 +1997,15 @@ static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
                 std::fprintf(stderr, "[cw] c128 payload at guest %08X (T0 reg=%04X cnt=%u)\n",
                              addr + (0x4200 - reg) * 4, reg, cnt);
             }
+            const bool traceCamera = ttt2_side_camera_diag::Active();
             for (uint32_t i = 0; i < cnt; ++i)
-                WriteReg(oneReg ? reg : reg + i, GRead32(g_base, addr + i * 4));
+            {
+                const uint32_t dst = oneReg ? reg : reg + i, src = addr + i * 4;
+                const uint32_t raw = GRead32(g_base, src);
+                if (traceCamera && ttt2_side_camera_diag::IsCameraRegister(dst))
+                    ttt2_side_camera_diag::OnConstantWrite(dst, raw, addr - 4, src, 0u);
+                WriteReg(dst, raw);
+            }
             addr += cnt * 4;
         }
         else if (type == 1)                                      // two independent registers
